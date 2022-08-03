@@ -1,0 +1,159 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  codepipeline-monorepo-trigger
+
+Parameters:
+  MonorepoSsmPrefix:
+    Type: String
+    Default: "{{cookiecutter.monorepo_ssm_prefix}}"
+  CodeCommitRepositoryName:
+    Type: String
+    Default: "{{cookiecutter.codecommit_repository_name}}"
+  MainGitBranch:
+    Type: String
+    Default: "{{cookiecutter.main_git_branch}}"
+
+Resources:
+  MonorepoTriggerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: |
+        import os
+        from typing import List
+        import boto3
+        from aws_lambda_powertools.logging import Logger
+        from aws_lambda_powertools.utilities import parameters
+        logger = Logger()
+        cc = boto3.client('codecommit')
+        cp = boto3.Session().client('codepipeline')
+        ssm = boto3.client('ssm')
+        ssm_prefix = os.environ.get('SSM_PREFIX', 'MonoRepoTrigger')
+        @logger.inject_lambda_context
+        def lambda_handler(event, _):
+            commit_id = event['detail']['commitId']
+            branch_name = event['detail']['referenceName']
+            repository = event['detail']['repositoryName']
+            paths = get_modified_files_since_last_run(repository, commit_id, branch_name)
+            toplevel_dirs = get_unique_toplevel_dirs(paths)
+            pipeline_names = resolve_pipeline_names(toplevel_dirs, repository, branch_name, )
+            logger.info({'paths': paths, 'toplevel_dirs': toplevel_dirs, 'pipeline_names': pipeline_names})
+            started_pipelines, failed_pipelines = start_codepipelines(pipeline_names)
+            logger.info({'started_pipelines': started_pipelines, 'failed_pipelines': failed_pipelines})
+            update_last_commit(repository, commit_id, branch_name)
+        def resolve_pipeline_names(toplevel_dirs, repository, _):
+            param_names = [os.path.join('/', ssm_prefix, repository, dir) for dir in toplevel_dirs]
+            return [parameters.get_parameter(p, force_fetch=True) for p in param_names]
+        def get_unique_toplevel_dirs(modified_files: List[str]):
+            toplevel_dirs = set(filter(lambda a: len(a) > 1, [file.split('/')[0] for file in modified_files]))
+            logger.info('toplevel dirs: %s', toplevel_dirs)
+            return list(toplevel_dirs)
+        def start_codepipelines(codepipeline_names):
+            failed_codepipelines, started_codepipelines = list(), list()
+            for codepipeline_name in codepipeline_names:
+                try:
+                    cp.start_pipeline_execution(name=codepipeline_name)
+                    logger.info(f'Started CodePipeline {codepipeline_name}.')
+                    started_codepipelines.append(codepipeline_name)
+                except cp.exceptions.PipelineNotFoundException:
+                    logger.info(f'Could not find CodePipeline {codepipeline_name}.')
+                    failed_codepipelines.append(codepipeline_name)
+            return (started_codepipelines, failed_codepipelines)
+        def param_name_last_commit(repository, branch_name):
+            return os.path.join('/', ssm_prefix, repository, branch_name, 'LastCommit')
+        def get_last_commit(repository, commit_id, branch_name):
+            param_name = param_name_last_commit(repository, branch_name)
+            try:
+                return parameters.get_parameter(param_name, force_fetch=True)
+            except ssm.exceptions.ClientError:
+                logger.info('not found ssm parameter %s', param_name)
+                commit = cc.get_commit(repositoryName=repository, commitId=commit_id)['commit']
+                parent = commit['parents'][0] if commit['parents'] else None
+                return parent
+        def update_last_commit(repository, commit_id, branch_name):
+            ssm.put_parameter(Name=param_name_last_commit(repository, branch_name),
+                              Description='Keep track of the last commit already triggered',
+                              Value=commit_id, Type='String', Overwrite=True)
+        def get_modified_files_since_last_run(repositoryName, afterCommitSpecifier, branch_name):
+            diff = None
+            last_commit = get_last_commit(repositoryName, afterCommitSpecifier, branch_name)
+            logger.info("last_commit: ", last_commit)
+            logger.info("commit_id: ", afterCommitSpecifier)
+            diff = cc.get_differences(
+                repositoryName=repositoryName,
+                beforeCommitSpecifier=last_commit,
+                afterCommitSpecifier=afterCommitSpecifier
+            )['differences']
+            logger.info('diff: %s', diff)
+            before_blob_paths = {d.get('beforeBlob', {}).get('path') for d in diff}
+            after_blob_paths = {d.get('afterBlob', {}).get('path') for d in diff}
+            all_modifications = before_blob_paths.union(after_blob_paths)
+            return list(filter(lambda f: f is not None, all_modifications))
+      Handler: index.lambda_handler
+      Runtime: python3.9
+      Timeout: 30
+      Layers:
+        - !Sub arn:aws:lambda:${AWS::Region}:017000801446:layer:AWSLambdaPowertoolsPython:22
+      Architectures:
+        - x86_64
+      Environment:
+        Variables:
+          SSM_PREFIX: !Ref MonorepoSsmPrefix
+      Policies:
+        - CodeCommitReadPolicy: 
+            RepositoryName: !Ref CodeCommitRepositoryName
+        - SSMParameterReadPolicy:
+            ParameterName: !Sub "${MonorepoSsmPrefix}/*"
+        - Statement:
+            - Effect: Allow
+              Action:
+                - ssm:PutParameter
+              Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${MonorepoSsmPrefix}/*"
+        - Statement:
+            - Effect: Allow
+              Action:
+                - codepipeline:StartPipelineExecution
+              # TODO: reduce the privilages on the codepipeline permission.
+              Resource: !Sub "arn:${AWS::Partition}:codepipeline:${AWS::Region}:${AWS::AccountId}:*"
+      Events:
+        EBRule:
+          Type: EventBridgeRule
+          Properties:
+            DeadLetterConfig:
+              Type: SQS
+              QueueLogicalId: EBRuleDLQ
+            Pattern:
+              source:
+                - aws.codecommit
+              detail-type:
+                - 'CodeCommit Repository State Change'
+              resources:
+                - !Sub "arn:${AWS::Partition}:codecommit:${AWS::Region}:${AWS::AccountId}:${CodeCommitRepositoryName}"
+              detail:
+                event:
+                  - referenceCreated
+                  - referenceUpdated
+                referenceType:
+                  - branch
+                referenceName:
+                  - !Ref MainGitBranch
+
+Outputs:
+  MonorepoTriggerFunctionArn:
+    Value: !GetAtt MonorepoTriggerFunction.Arn
+  MonorepoTriggerRegion:
+    Value: !Ref AWS::Region
+    Export:
+      Name: !Sub "${AWS::StackName}-MonorepoTriggerRegion"
+  MonorepoSsmPrefixValue:
+    Value: !Ref MonorepoSsmPrefix
+    Export:
+      Name: !Sub "${AWS::StackName}-MonorepoSsmPrefix"
+  CodeCommitRepositoryNameValue:
+    Value: !Ref CodeCommitRepositoryName
+    Export:
+      Name: !Sub "${AWS::StackName}-CodeCommitRepositoryName"
+  MainGitBranchValue:
+    Value: !Ref MainGitBranch
+    Export:
+      Name: !Sub "${AWS::StackName}-MainGitBranch"

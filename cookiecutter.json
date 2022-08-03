@@ -1,0 +1,6 @@
+{
+    "project_name": "sam-project",
+    "codecommit_repository_name": "sam-project-repo",
+    "main_git_branch": "main",
+    "monorepo_ssm_prefix": "MonoRepoTrigger"
+}

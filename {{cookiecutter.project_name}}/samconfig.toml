@@ -1,0 +1,10 @@
+version = 0.1
+[default]
+[default.deploy]
+[default.deploy.parameters]
+template = "monorepo-root.yaml"
+stack_name = "{{cookiecutter.project_name}}-monorepo-root"
+s3_prefix = "{{cookiecutter.project_name}}-monorepo-root"
+resolve_s3 = true
+capabilities = "CAPABILITY_IAM"
+image_repositories = []
