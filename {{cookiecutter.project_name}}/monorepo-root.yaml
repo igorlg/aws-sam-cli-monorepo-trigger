@@ -18,7 +18,7 @@ Resources:
   MonorepoTriggerFunction:
     Type: AWS::Serverless::Function
     Properties:
-      CodeUri: |
+      InlineCode: |
         import os
         from typing import List
         import boto3
