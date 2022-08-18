@@ -34,6 +34,7 @@ Resources:
         logger = Logger()
         cc = boto3.client('codecommit')
         cp = boto3.client('codepipeline')
+        ssm = boto3.client('ssm')
         ssm_prefix = os.environ.get('SSM_PREFIX', 'MonoRepoTrigger')
         @logger.inject_lambda_context
         def lambda_handler(event, _):
