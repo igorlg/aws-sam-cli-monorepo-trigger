@@ -3,6 +3,13 @@ Transform: AWS::Serverless-2016-10-31
 Description: >
   codepipeline-monorepo-trigger
 
+Metadata:
+  cfn-lint:
+    config:
+      ignore_checks:
+        - I3011
+        - I3013
+
 Parameters:
   MonorepoSsmPrefix:
     Type: String
@@ -26,8 +33,7 @@ Resources:
         from aws_lambda_powertools.utilities import parameters
         logger = Logger()
         cc = boto3.client('codecommit')
-        cp = boto3.Session().client('codepipeline')
-        ssm = boto3.client('ssm')
+        cp = boto3.client('codepipeline')
         ssm_prefix = os.environ.get('SSM_PREFIX', 'MonoRepoTrigger')
         @logger.inject_lambda_context
         def lambda_handler(event, _):
@@ -36,23 +42,20 @@ Resources:
             repository = event['detail']['repositoryName']
             paths = get_modified_files_since_last_run(repository, commit_id, branch_name)
             toplevel_dirs = get_unique_toplevel_dirs(paths)
-            pipeline_names = resolve_pipeline_names(toplevel_dirs, repository, branch_name, )
+            pipeline_names = resolve_pipeline_names(toplevel_dirs, repository)
             logger.info({'paths': paths, 'toplevel_dirs': toplevel_dirs, 'pipeline_names': pipeline_names})
             started_pipelines, failed_pipelines = start_codepipelines(pipeline_names)
             logger.info({'started_pipelines': started_pipelines, 'failed_pipelines': failed_pipelines})
             update_last_commit(repository, commit_id, branch_name)
-        def resolve_pipeline_names(toplevel_dirs, repository, _):
-            param_names = [os.path.join('/', ssm_prefix, repository, dir, "PipelineName") for dir in toplevel_dirs]
-            print(param_names)
+        def resolve_pipeline_names(toplevel_dirs, repository):
             out = []
-            for p in param_names:
+            for p in [os.path.join('/', ssm_prefix, repository, dir, 'PipelineName') for dir in toplevel_dirs]:
                 try:
                     out.append(parameters.get_parameter(p, force_fetch=True))
                 except parameters.GetParameterError:
                     pass
             return out
-            # return [parameters.get_parameter(p, force_fetch=True) for p in param_names]
-        def get_unique_toplevel_dirs(modified_files: List[str]):
+        def get_unique_toplevel_dirs(modified_files):
             toplevel_dirs = set(filter(lambda a: len(a) > 1, [file.split('/')[0] for file in modified_files]))
             logger.info('toplevel dirs: %s', toplevel_dirs)
             return list(toplevel_dirs)
@@ -80,19 +83,16 @@ Resources:
                 return parent
         def update_last_commit(repository, commit_id, branch_name):
             ssm.put_parameter(Name=param_name_last_commit(repository, branch_name),
-                              Description='Keep track of the last commit already triggered',
-                              Value=commit_id, Type='String', Overwrite=True)
-        def get_modified_files_since_last_run(repositoryName, afterCommitSpecifier, branch_name):
-            diff = None
-            last_commit = get_last_commit(repositoryName, afterCommitSpecifier, branch_name)
-            logger.info("last_commit: ", last_commit)
-            logger.info("commit_id: ", afterCommitSpecifier)
-            diff = cc.get_differences(
-                repositoryName=repositoryName,
-                beforeCommitSpecifier=last_commit,
-                afterCommitSpecifier=afterCommitSpecifier
-            )['differences']
-            logger.info('diff: %s', diff)
+                                Description='Keep track of the last commit already triggered',
+                                Value=commit_id, Type='String', Overwrite=True)
+        def get_modified_files_since_last_run(repo_name, after_commit, branch_name):
+            last_commit = get_last_commit(repo_name, after_commit, branch_name)
+            diff = cc.get_differences(repositoryName=repo_name,
+                                        beforeCommitSpecifier=last_commit,
+                                        afterCommitSpecifier=after_commit
+                                    ).get('differences', None)
+            logger.info(f"last_commit: '{last_commit}' - commit_id: '{after_commit}'")
+            logger.info(f"diff: {diff}")
             before_blob_paths = {d.get('beforeBlob', {}).get('path') for d in diff}
             after_blob_paths = {d.get('afterBlob', {}).get('path') for d in diff}
             all_modifications = before_blob_paths.union(after_blob_paths)
@@ -101,7 +101,7 @@ Resources:
       Runtime: python3.9
       Timeout: 30
       Layers:
-        - !Sub arn:aws:lambda:${AWS::Region}:017000801446:layer:AWSLambdaPowertoolsPython:22
+        - !Sub arn:${AWS::Partition}:lambda:${AWS::Region}:017000801446:layer:AWSLambdaPowertoolsPython:22
       Architectures:
         - x86_64
       Environment:
